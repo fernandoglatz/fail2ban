@@ -22,3 +22,5 @@ Here are a list of settings you can optionally set for the Middleware
 | RedisAddress | `""` | Redis server address in format `host:port` (e.g., `redis:6379`). If not set, uses in-memory storage |
 | RedisPassword | `""` | Redis authentication password. Leave empty if Redis has no password |
 | RedisDB | `0` | Redis database number to use (0-15) |
+| AllowlistCIDRs | `[]` | List of CIDR ranges to allowlist (e.g., `["10.0.0.0/8", "192.168.1.0/24"]`). IPs matching these ranges will never be banned or tracked |
+| DenylistCIDRs | `[]` | List of CIDR ranges to denylist (e.g., `["192.0.2.0/24", "198.51.100.5/32"]`). IPs matching these ranges will be immediately blocked with 403 Forbidden |

@@ -16,27 +16,31 @@ import (
 
 // Config passed in from traefik configuration
 type Config struct {
-	NumberFails   uint
-	BanTime       string
-	FailWindow    string
-	ClientHeader  string
-	LogLevel      log.LogLevel
-	RedisAddress  string
-	RedisPassword string
-	RedisDB       int
+	NumberFails    uint
+	BanTime        string
+	FailWindow     string
+	ClientHeader   string
+	LogLevel       log.LogLevel
+	RedisAddress   string
+	RedisPassword  string
+	RedisDB        int
+	AllowlistCIDRs []string
+	DenylistCIDRs  []string
 }
 
 // Create config with reasonable defaults
 func CreateConfig() *Config {
 	return &Config{
-		NumberFails:   3,
-		BanTime:       "3h",
-		FailWindow:    "10m",
-		ClientHeader:  "Cf-Connecting-IP",
-		LogLevel:      log.Info,
-		RedisAddress:  "",
-		RedisPassword: "",
-		RedisDB:       0,
+		NumberFails:    3,
+		BanTime:        "3h",
+		FailWindow:     "10m",
+		ClientHeader:   "Cf-Connecting-IP",
+		LogLevel:       log.Info,
+		RedisAddress:   "",
+		RedisPassword:  "",
+		RedisDB:        0,
+		AllowlistCIDRs: []string{},
+		DenylistCIDRs:  []string{},
 	}
 }
 
@@ -47,11 +51,13 @@ type fail2Ban struct {
 	logger *log.Logger
 
 	// Stuff specific to this plugin
-	maxFails      uint
-	banTime       time.Duration
-	failWindow    time.Duration
-	clientHeader  string
-	bannedClients map[string]*client
+	maxFails       uint
+	banTime        time.Duration
+	failWindow     time.Duration
+	clientHeader   string
+	allowlistCIDRs []*net.IPNet
+	denylistCIDRs  []*net.IPNet
+	bannedClients  map[string]*client
 	// mutex is specifically access the bannedClients map
 	mu sync.Mutex
 
@@ -76,15 +82,37 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	if err != nil {
 		return nil, err
 	}
+	// Parse allowlist CIDRs
+	allowlistCIDRs := make([]*net.IPNet, 0, len(config.AllowlistCIDRs))
+	for _, cidr := range config.AllowlistCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR in allowlist %q: %w", cidr, err)
+		}
+		allowlistCIDRs = append(allowlistCIDRs, ipNet)
+	}
+
+	// Parse denylist CIDRs
+	denylistCIDRs := make([]*net.IPNet, 0, len(config.DenylistCIDRs))
+	for _, cidr := range config.DenylistCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR in denylist %q: %w", cidr, err)
+		}
+		denylistCIDRs = append(denylistCIDRs, ipNet)
+	}
+
 	f := fail2Ban{
-		name:          middleWareName,
-		logger:        log.New("Fail-2-Ban", config.LogLevel),
-		next:          next,
-		maxFails:      config.NumberFails,
-		clientHeader:  config.ClientHeader,
-		banTime:       duration,
-		failWindow:    failWindow,
-		bannedClients: make(map[string]*client),
+		name:           middleWareName,
+		logger:         log.New("Fail-2-Ban", config.LogLevel),
+		next:           next,
+		maxFails:       config.NumberFails,
+		clientHeader:   config.ClientHeader,
+		banTime:        duration,
+		failWindow:     failWindow,
+		allowlistCIDRs: allowlistCIDRs,
+		denylistCIDRs:  denylistCIDRs,
+		bannedClients:  make(map[string]*client),
 	}
 
 	// Connect to Redis using plain socket if configured
@@ -99,6 +127,12 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	}
 
 	f.logger.Infof("Max Number Failures %d, Ban Time %q, Fail Window %q, Client-ID-header %q", f.maxFails, f.banTime, f.failWindow, f.clientHeader)
+	if len(f.allowlistCIDRs) > 0 {
+		f.logger.Infof("Allowlist CIDRs: %v", config.AllowlistCIDRs)
+	}
+	if len(f.denylistCIDRs) > 0 {
+		f.logger.Infof("Denylist CIDRs: %v", config.DenylistCIDRs)
+	}
 	go f.cleaner(ctx)
 
 	return &f, err
@@ -114,9 +148,25 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	f.logger.Debugf("Request from %s", client)
 
+	// Block denylisted IPs immediately
+	if f.isIPDenylisted(client) {
+		f.logger.Infof("%s is denylisted, blocking request", client)
+		rw.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(rw, "You're banned: %s", client)
+		return
+	}
+
+	// Skip ban logic for allowlisted IPs
+	if f.isIPAllowlisted(client) {
+		f.logger.Debugf("%s is allowlisted, skipping ban check", client)
+		f.next.ServeHTTP(rw, req)
+		return
+	}
+
 	// block request if client has been banned
 	if f.isClientBanned(client) {
 		rw.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(rw, "You're banned: %s", client)
 		return
 	}
 
@@ -128,6 +178,44 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if i.checkBadUserRequestStatusCode() {
 		f.incrementViewCounter(client)
 	}
+}
+
+func (f *fail2Ban) isIPDenylisted(ipStr string) bool {
+	if len(f.denylistCIDRs) == 0 {
+		return false
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		f.logger.Debugf("Failed to parse IP %s for denylist check", ipStr)
+		return false
+	}
+
+	for _, cidr := range f.denylistCIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fail2Ban) isIPAllowlisted(ipStr string) bool {
+	if len(f.allowlistCIDRs) == 0 {
+		return false
+	}
+
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		f.logger.Debugf("Failed to parse IP %s for allowlist check", ipStr)
+		return false
+	}
+
+	for _, cidr := range f.allowlistCIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fail2Ban) isClientBanned(ip string) bool {

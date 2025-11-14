@@ -25,3 +25,7 @@ testData:
   RedisAddress: redis:6379
   RedisPassword: ""
   RedisDB: 0
+  AllowlistCIDRs:
+    - 10.0.0.0/8
+  DenylistCIDRs:
+    - 192.0.2.0/24
