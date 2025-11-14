@@ -148,18 +148,18 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	f.logger.Debugf("Request from %s", client)
 
+	// Skip ban logic for allowlisted IPs (allowlist takes precedence)
+	if f.isIPAllowlisted(client) {
+		f.logger.Debugf("%s is allowlisted, skipping ban check", client)
+		f.next.ServeHTTP(rw, req)
+		return
+	}
+
 	// Block denylisted IPs immediately
 	if f.isIPDenylisted(client) {
 		f.logger.Infof("%s is denylisted, blocking request", client)
 		rw.WriteHeader(http.StatusForbidden)
 		fmt.Fprintf(rw, "You're banned: %s", client)
-		return
-	}
-
-	// Skip ban logic for allowlisted IPs
-	if f.isIPAllowlisted(client) {
-		f.logger.Debugf("%s is allowlisted, skipping ban check", client)
-		f.next.ServeHTTP(rw, req)
 		return
 	}
 
@@ -568,8 +568,15 @@ func (f *fail2Ban) extractClient(req *http.Request) (string, error) {
 		if len(client) == 0 {
 			return "", fmt.Errorf("failed to extract Client Identifier from %q Header", f.clientHeader)
 		}
+
+		host, _, err := net.SplitHostPort(client)
+		if err == nil {
+			client = host
+		}
+
 		return client, nil
 	}
+
 	if client, _, err := net.SplitHostPort(req.RemoteAddr); err != nil {
 		return "", fmt.Errorf("failed to extract Client IP from RemoteAddr: %w", err)
 	} else {
