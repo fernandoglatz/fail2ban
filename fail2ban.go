@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charanpreetp/fail2ban/log"
+	"github.com/redis/go-redis/v9"
 )
 
 // Config passed in from traefik configuration
@@ -17,6 +18,9 @@ type Config struct {
 	BanTime      string
 	ClientHeader string
 	LogLevel     log.LogLevel
+	RedisAddr    string
+	RedisPass    string
+	RedisDB      int
 }
 
 // Create config with reasonable defaults
@@ -26,6 +30,9 @@ func CreateConfig() *Config {
 		BanTime:      "3h",
 		ClientHeader: "Cf-Connecting-IP",
 		LogLevel:     log.Info,
+		RedisAddr:    "",
+		RedisPass:    "",
+		RedisDB:      0,
 	}
 }
 
@@ -42,6 +49,9 @@ type fail2Ban struct {
 	bannedClients map[string]*client
 	// mutex is specifically access the bannedClients map
 	mu sync.Mutex
+
+	// Redis client (optional)
+	redisClient *redis.Client
 
 	// this is a test var to signal cleaner is running
 	_cleaning_test_var bool
@@ -61,6 +71,23 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		banTime:       duration,
 		bannedClients: make(map[string]*client),
 	}
+
+	// Connect to Redis if configured
+	if config.RedisAddr != "" {
+		f.redisClient = redis.NewClient(&redis.Options{
+			Addr:     config.RedisAddr,
+			Password: config.RedisPass,
+			DB:       config.RedisDB,
+		})
+
+		// Test the connection
+		if err := f.redisClient.Ping(ctx).Err(); err != nil {
+			f.logger.Errorf("Failed to connect to Redis: %v", err)
+			return nil, fmt.Errorf("redis connection failed: %w", err)
+		}
+		f.logger.Infof("Connected to Redis at %s", config.RedisAddr)
+	}
+
 	f.logger.Infof("Max Number Failures %d, Ban Time %q, Client-ID-header %q", f.maxFails, f.banTime, f.clientHeader)
 	go f.cleaner(ctx)
 
@@ -94,6 +121,14 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (f *fail2Ban) isClientBanned(ip string) bool {
+	ctx := context.Background()
+
+	// Use Redis if configured
+	if f.redisClient != nil {
+		return f.isClientBannedRedis(ctx, ip)
+	}
+
+	// Fall back to in-memory
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logger.Debugf("Checking for %s", ip)
@@ -116,6 +151,15 @@ func (f *fail2Ban) isClientBanned(ip string) bool {
 }
 
 func (f *fail2Ban) incrementViewCounter(ip string) {
+	ctx := context.Background()
+
+	// Use Redis if configured
+	if f.redisClient != nil {
+		f.incrementViewCounterRedis(ctx, ip)
+		return
+	}
+
+	// Fall back to in-memory
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logger.Debugf("Increment %s", ip)
@@ -156,6 +200,54 @@ func (f *fail2Ban) cleaner(ctx context.Context) {
 			f.mu.Unlock()
 		}
 		timer.Reset(f.banTime / 4)
+	}
+}
+
+func (f *fail2Ban) isClientBannedRedis(ctx context.Context, ip string) bool {
+	key := fmt.Sprintf("fail2ban:%s", ip)
+
+	// Get fail counter from Redis
+	val, err := f.redisClient.Get(ctx, key).Uint64()
+	if err == redis.Nil {
+		// Key doesn't exist, client is not banned
+		return false
+	} else if err != nil {
+		f.logger.Errorf("Redis error checking %s: %v", ip, err)
+		return false
+	}
+
+	failCounter := uint(val)
+	f.logger.Debugf("Checking for %s (count: %d)", ip, failCounter)
+
+	if failCounter >= f.maxFails {
+		// Client is banned, extend the TTL
+		f.logger.Infof("Extend Ban for %s", ip)
+		f.redisClient.Expire(ctx, key, f.banTime)
+		return true
+	}
+
+	return false
+}
+
+func (f *fail2Ban) incrementViewCounterRedis(ctx context.Context, ip string) {
+	key := fmt.Sprintf("fail2ban:%s", ip)
+
+	// Increment counter in Redis
+	count, err := f.redisClient.Incr(ctx, key).Result()
+	if err != nil {
+		f.logger.Errorf("Redis error incrementing %s: %v", ip, err)
+		return
+	}
+
+	f.logger.Debugf("Increment %s (count: %d)", ip, count)
+
+	// Set expiration on first increment
+	if count == 1 {
+		f.redisClient.Expire(ctx, key, f.banTime)
+	} else if uint(count) >= f.maxFails {
+		// Reset TTL when client gets banned
+		f.redisClient.Expire(ctx, key, f.banTime)
+		f.logger.Infof("Banned %s after %d failures", ip, count)
 	}
 }
 
