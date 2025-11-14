@@ -16,6 +16,7 @@ import (
 type Config struct {
 	NumberFails  uint
 	BanTime      string
+	FailWindow   string
 	ClientHeader string
 	LogLevel     log.LogLevel
 	RedisAddr    string
@@ -28,6 +29,7 @@ func CreateConfig() *Config {
 	return &Config{
 		NumberFails:  3,
 		BanTime:      "3h",
+		FailWindow:   "10m",
 		ClientHeader: "Cf-Connecting-IP",
 		LogLevel:     log.Info,
 		RedisAddr:    "",
@@ -45,6 +47,7 @@ type fail2Ban struct {
 	// Stuff specific to this plugin
 	maxFails      uint
 	banTime       time.Duration
+	failWindow    time.Duration
 	clientHeader  string
 	bannedClients map[string]*client
 	// mutex is specifically access the bannedClients map
@@ -62,6 +65,10 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	if err != nil {
 		return nil, err
 	}
+	failWindow, err := time.ParseDuration(config.FailWindow)
+	if err != nil {
+		return nil, err
+	}
 	f := fail2Ban{
 		name:          middleWareName,
 		logger:        log.New("Fail-2-Ban", config.LogLevel),
@@ -69,6 +76,7 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		maxFails:      config.NumberFails,
 		clientHeader:  config.ClientHeader,
 		banTime:       duration,
+		failWindow:    failWindow,
 		bannedClients: make(map[string]*client),
 	}
 
@@ -88,7 +96,7 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		f.logger.Infof("Connected to Redis at %s", config.RedisAddr)
 	}
 
-	f.logger.Infof("Max Number Failures %d, Ban Time %q, Client-ID-header %q", f.maxFails, f.banTime, f.clientHeader)
+	f.logger.Infof("Max Number Failures %d, Ban Time %q, Fail Window %q, Client-ID-header %q", f.maxFails, f.banTime, f.failWindow, f.clientHeader)
 	go f.cleaner(ctx)
 
 	return &f, err
@@ -163,14 +171,25 @@ func (f *fail2Ban) incrementViewCounter(ip string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logger.Debugf("Increment %s", ip)
+	now := time.Now()
 	if f.bannedClients[ip] == nil {
 		f.bannedClients[ip] = &client{
-			failCounter: 1,
+			firstFailure: now,
+			lastViewed:   now,
+			failCounter:  1,
 		}
 		return
 	}
-	f.bannedClients[ip].lastViewed = time.Now()
-	f.bannedClients[ip].failCounter++
+
+	// Check if we're outside the failure window - reset counter if so
+	if now.Sub(f.bannedClients[ip].firstFailure) > f.failWindow {
+		f.logger.Infof("Resetting counter for %s - outside failure window", ip)
+		f.bannedClients[ip].firstFailure = now
+		f.bannedClients[ip].failCounter = 1
+	} else {
+		f.bannedClients[ip].failCounter++
+	}
+	f.bannedClients[ip].lastViewed = now
 }
 
 // periodically clean up banned clients
@@ -241,11 +260,11 @@ func (f *fail2Ban) incrementViewCounterRedis(ctx context.Context, ip string) {
 
 	f.logger.Debugf("Increment %s (count: %d)", ip, count)
 
-	// Set expiration on first increment
+	// Set expiration on first increment to the failure window
 	if count == 1 {
-		f.redisClient.Expire(ctx, key, f.banTime)
+		f.redisClient.Expire(ctx, key, f.failWindow)
 	} else if uint(count) >= f.maxFails {
-		// Reset TTL when client gets banned
+		// Reset TTL to ban time when client gets banned
 		f.redisClient.Expire(ctx, key, f.banTime)
 		f.logger.Infof("Banned %s after %d failures", ip, count)
 	}
@@ -288,8 +307,9 @@ func (i *interceptor) WriteHeader(code int) {
 
 // client data tracking struct
 type client struct {
-	lastViewed  time.Time
-	failCounter uint
+	firstFailure time.Time
+	lastViewed   time.Time
+	failCounter  uint
 }
 
 func (c client) hasBanExpired(currentTime time.Time, d time.Duration) bool {

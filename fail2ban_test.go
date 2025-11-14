@@ -23,6 +23,7 @@ func TestSeverNotBanned(t *testing.T) {
 		}),
 		&Config{
 			BanTime:     "1s",
+			FailWindow:  "1s",
 			LogLevel:    "ERROR",
 			NumberFails: 3,
 		},
@@ -61,6 +62,7 @@ func TestSeverBanned(t *testing.T) {
 		}),
 		&Config{
 			BanTime:     "100ms",
+			FailWindow:  "100ms",
 			LogLevel:    "ERROR",
 			NumberFails: 3,
 		},
@@ -127,6 +129,7 @@ func TestSeverMultipleClientsAtOnce(t *testing.T) {
 		}),
 		&Config{
 			BanTime:      "1s",
+			FailWindow:   "1s",
 			LogLevel:     "ERROR",
 			ClientHeader: "header",
 			NumberFails:  3,
@@ -194,6 +197,7 @@ func TestCheckViewCounter(t *testing.T) {
 		nil,
 		&Config{
 			BanTime:     "1s",
+			FailWindow:  "1s",
 			LogLevel:    "ERROR",
 			NumberFails: 3,
 		},
@@ -207,13 +211,15 @@ func TestCheckViewCounter(t *testing.T) {
 	f := h.(*fail2Ban)
 	// Client 1 is banned
 	f.bannedClients["1"] = &client{
-		lastViewed:  time.Now(),
-		failCounter: 10,
+		firstFailure: time.Now(),
+		lastViewed:   time.Now(),
+		failCounter:  10,
 	}
 	// Client 2 is no banned
 	f.bannedClients["2"] = &client{
-		lastViewed:  time.Now(),
-		failCounter: 1,
+		firstFailure: time.Now(),
+		lastViewed:   time.Now(),
+		failCounter:  1,
 	}
 
 	if f.isClientBanned("0") {
@@ -245,6 +251,7 @@ func TestIncrementingViewCounter(t *testing.T) {
 		nil,
 		&Config{
 			BanTime:     "1s",
+			FailWindow:  "1s",
 			NumberFails: 3,
 		},
 		"test",
@@ -275,14 +282,14 @@ func TestIncrementingViewCounter(t *testing.T) {
 	if f.bannedClients["1"].failCounter != 1 {
 		t.Error("Client 1 should have 1 view")
 	}
-	if f.bannedClients["1"].lastViewed.After(start) {
+	if !f.bannedClients["1"].lastViewed.After(start) {
 		t.Error("Client 1 view time should be set to after test start time")
 	}
 
 	if f.bannedClients["2"].failCounter != 1 {
 		t.Error("Client 2 should have 1 view")
 	}
-	if f.bannedClients["2"].lastViewed.After(start) {
+	if !f.bannedClients["2"].lastViewed.After(start) {
 		t.Error("Client 2 view time should be set to after test start time")
 	}
 
@@ -302,8 +309,9 @@ func TestCleaner(t *testing.T) {
 		ctx,
 		nil,
 		&Config{
-			BanTime:  "1us",
-			LogLevel: "ERROR",
+			BanTime:    "1us",
+			FailWindow: "1us",
+			LogLevel:   "ERROR",
 		},
 		"test",
 	)
@@ -345,10 +353,10 @@ func TestCleaner(t *testing.T) {
 	f.mu.Lock()
 	f.banTime = time.Microsecond
 	f.bannedClients = make(map[string]*client)
-	f.bannedClients["1"] = &client{}
-	f.bannedClients["2"] = &client{}
-	f.bannedClients["3"] = &client{}
-	f.bannedClients["4"] = &client{}
+	f.bannedClients["1"] = &client{firstFailure: time.Time{}}
+	f.bannedClients["2"] = &client{firstFailure: time.Time{}}
+	f.bannedClients["3"] = &client{firstFailure: time.Time{}}
+	f.bannedClients["4"] = &client{firstFailure: time.Time{}}
 	f.mu.Unlock()
 
 	// wait for cleaner to clean
@@ -364,11 +372,12 @@ func TestCleaner(t *testing.T) {
 	f.banTime = time.Microsecond
 	f.bannedClients = make(map[string]*client)
 	f.bannedClients["1"] = &client{
-		lastViewed: time.Now().Add(time.Minute),
+		firstFailure: time.Now(),
+		lastViewed:   time.Now().Add(time.Minute),
 	}
-	f.bannedClients["2"] = &client{}
-	f.bannedClients["3"] = &client{}
-	f.bannedClients["4"] = &client{}
+	f.bannedClients["2"] = &client{firstFailure: time.Time{}}
+	f.bannedClients["3"] = &client{firstFailure: time.Time{}}
+	f.bannedClients["4"] = &client{firstFailure: time.Time{}}
 	f.mu.Unlock()
 
 	// wait for cleaner to clean
@@ -395,7 +404,8 @@ func TestCleanerShutsDown(t *testing.T) {
 		ctx,
 		nil,
 		&Config{
-			BanTime: "1s",
+			BanTime:    "1s",
+			FailWindow: "1s",
 		},
 		"test",
 	)
@@ -565,15 +575,17 @@ func TestHasBanExpired(t *testing.T) {
 	}{
 		"has expired": {
 			client: client{
-				time.Now().Add(-2 * d),
-				0,
+				firstFailure: time.Time{},
+				lastViewed:   time.Now().Add(-2 * d),
+				failCounter:  0,
 			},
 			hasExpired: true,
 		},
 		"has not expired": {
 			client: client{
-				time.Now(),
-				0,
+				firstFailure: time.Time{},
+				lastViewed:   time.Now(),
+				failCounter:  0,
 			},
 			hasExpired: false,
 		},
