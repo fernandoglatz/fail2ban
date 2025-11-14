@@ -20,4 +20,8 @@ summary: Ban IPs that make too many bad HTTP requests (ie, the response from dow
 testData:
   NumberFails: 3
   BanTime: 1h
+  FailWindow: 10m
   ClientHeader: Cf-Connecting-IP
+  RedisAddress: redis:6379
+  RedisPassword: ""
+  RedisDB: 0

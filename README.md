@@ -16,5 +16,9 @@ Here are a list of settings you can optionally set for the Middleware
 | ------ | ------ | ------ |
 | NumberFails | `3` | Number of times a client can make a request with a 4xx class HTTP response code before it gets banned |
 | BanTime | `3h` | How long to Ban clients who make too many bad requests. Valid time units are `ns`, `us` (or `µs`), `ms`, `s`, `m`, `h`. Eg, `3h30m` would be for banning for 3 hours and 30 minutes |
+| FailWindow | `10m` | Time window to track failures before resetting the counter. Valid time units are `ns`, `us` (or `µs`), `ms`, `s`, `m`, `h` |
 | ClientHeader | `Cf-Connecting-IP` | You want to use a specific header to track clients. Useful if the client's real IP is in a header when you're behind CloudFlare, a LoadBalancer or WAF, etc. If this is not set, it will just use the [RemoteAddr's](https://cs.opensource.google/go/go/+/refs/tags/go1.21.6:src/net/http/request.go;l=294) IP |
 | LogLevel | `INFO` | Log verbosity level, can be `DEBUG`, `INFO`, `WARN`, or `ERROR` |
+| RedisAddress | `""` | Redis server address in format `host:port` (e.g., `redis:6379`). If not set, uses in-memory storage |
+| RedisPassword | `""` | Redis authentication password. Leave empty if Redis has no password |
+| RedisDB | `0` | Redis database number to use (0-15) |
