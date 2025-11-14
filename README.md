@@ -61,6 +61,8 @@ The notification is sent as JSON with the following structure:
 
 ### Example Configuration
 
+**YAML format:**
+
 ```yaml
 http:
   middlewares:
@@ -90,4 +92,37 @@ http:
           NotifyHeaders:
             API_KEY: "secret123"
             Authorization: "Bearer your-token"
+```
+
+**TOML format:**
+
+```toml
+[http.middlewares]
+  [http.middlewares.my-fail2ban.plugin.fail2ban]
+    NumberFails = 5
+    BanTime = "1h"
+    FailWindow = "10m"
+    ClientHeader = "X-Real-Ip"
+    LogLevel = "INFO"
+    # Redis configuration (optional - uses in-memory if not set)
+    RedisAddress = "redis:6379"
+    RedisPassword = "your-redis-password"
+    RedisDB = 0
+    # Allowlist trusted IPs/ranges (never banned)
+    AllowlistCIDRs = [
+      "10.0.0.0/8",        # Private network
+      "192.168.1.0/24",    # Local network
+      "203.0.113.5/32"     # Specific trusted IP
+    ]
+    # Denylist malicious IPs/ranges (always blocked)
+    DenylistCIDRs = [
+      "192.0.2.0/24",      # Known bad network
+      "198.51.100.50/32"   # Specific bad IP
+    ]
+    # Ban notification webhook (optional)
+    NotifyURL = "https://api.example.com/ban-webhook"
+    
+    [http.middlewares.my-fail2ban.plugin.fail2ban.NotifyHeaders]
+      API_KEY = "secret123"
+      Authorization = "Bearer your-token"
 ```
