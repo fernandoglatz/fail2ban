@@ -151,17 +151,17 @@ func (f *fail2Ban) isClientBanned(ip string) bool {
 	// Fall back to in-memory
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.logger.Debugf("Checking for %s", ip)
+	f.logger.Debugf("[In-Memory] Checking for %s", ip)
 	if c, ok := f.bannedClients[ip]; !ok {
 		return false
 	} else if c.failCounter >= f.maxFails {
 		// Un-ban
 		if c.hasBanExpired(time.Now(), f.banTime) {
-			f.logger.Infof("Un-Banned %s", ip)
+			f.logger.Infof("[In-Memory] Un-Banned %s", ip)
 			delete(f.bannedClients, ip)
 		} else {
 			// extend Ban
-			f.logger.Infof("Extend Ban for %s", ip)
+			f.logger.Infof("[In-Memory] Extend Ban for %s", ip)
 			c.failCounter++
 			c.lastViewed = time.Now()
 			return true
@@ -180,7 +180,7 @@ func (f *fail2Ban) incrementViewCounter(ip string) {
 	// Fall back to in-memory
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.logger.Debugf("Increment %s", ip)
+	f.logger.Debugf("[In-Memory] Increment %s", ip)
 	now := time.Now()
 	if f.bannedClients[ip] == nil {
 		f.bannedClients[ip] = &client{
@@ -193,7 +193,7 @@ func (f *fail2Ban) incrementViewCounter(ip string) {
 
 	// Check if we're outside the failure window - reset counter if so
 	if now.Sub(f.bannedClients[ip].firstFailure) > f.failWindow {
-		f.logger.Infof("Resetting counter for %s - outside failure window", ip)
+		f.logger.Infof("[In-Memory] Resetting counter for %s - outside failure window", ip)
 		f.bannedClients[ip].firstFailure = now
 		f.bannedClients[ip].failCounter = 1
 	} else {
@@ -219,10 +219,10 @@ func (f *fail2Ban) cleaner(ctx context.Context) {
 				now := time.Now()
 				for ip, c := range f.bannedClients {
 					if c.hasBanExpired(now, f.banTime) {
-						f.logger.Infof("Clearing out state for %s, it is no longer banned", ip)
+						f.logger.Infof("[In-Memory] Clearing out state for %s, it is no longer banned", ip)
 						delete(f.bannedClients, ip)
 					} else {
-						f.logger.Debugf("%s still needs to be tracked", ip)
+						f.logger.Debugf("[In-Memory] %s still needs to be tracked", ip)
 					}
 				}
 			}
@@ -342,11 +342,11 @@ func (f *fail2Ban) isClientBannedRedis(ip string) bool {
 	}
 
 	failCounter := uint(val)
-	f.logger.Debugf("Checking for %s (count: %d)", ip, failCounter)
+	f.logger.Debugf("[Redis] Checking for %s (count: %d)", ip, failCounter)
 
 	if failCounter >= f.maxFails {
 		// Client is banned, extend the TTL
-		f.logger.Infof("Extend Ban for %s", ip)
+		f.logger.Infof("[Redis] Extend Ban for %s", ip)
 		f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banTime.Seconds())))
 		return true
 	}
@@ -364,7 +364,7 @@ func (f *fail2Ban) incrementViewCounterRedis(ip string) {
 		return
 	}
 
-	f.logger.Debugf("Increment %s (count: %d)", ip, count)
+	f.logger.Debugf("[Redis] Increment %s (count: %d)", ip, count)
 
 	// Set expiration on first increment to the failure window
 	if count == 1 {
@@ -372,7 +372,7 @@ func (f *fail2Ban) incrementViewCounterRedis(ip string) {
 	} else if uint(count) >= f.maxFails {
 		// Reset TTL to ban time when client gets banned
 		f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banTime.Seconds())))
-		f.logger.Infof("Banned %s after %d failures", ip, count)
+		f.logger.Infof("[Redis] Banned %s after %d failures", ip, count)
 	}
 }
 
