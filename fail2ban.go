@@ -53,12 +53,14 @@ func CreateConfig() *Config {
 // NotificationRequest contains the request details in the ban notification
 type NotificationRequest struct {
 	Method     string              `json:"method"`
+	Scheme     string              `json:"scheme"`
 	Path       string              `json:"path"`
 	Query      string              `json:"query"`
 	Host       string              `json:"host"`
 	UserAgent  string              `json:"user_agent"`
 	Referer    string              `json:"referer"`
 	RemoteAddr string              `json:"remote_addr"`
+	RequestURI string              `json:"request_uri"`
 	Headers    map[string][]string `json:"headers"`
 }
 
@@ -616,12 +618,14 @@ func (f *fail2Ban) sendBanNotification(ip string, failCount uint, originalReq *h
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 			Request: NotificationRequest{
 				Method:     originalReq.Method,
+				Scheme:     originalReq.URL.Scheme,
 				Path:       originalReq.URL.Path,
 				Query:      originalReq.URL.RawQuery,
 				Host:       originalReq.Host,
 				UserAgent:  originalReq.UserAgent(),
 				Referer:    originalReq.Referer(),
 				RemoteAddr: originalReq.RemoteAddr,
+				RequestURI: originalReq.RequestURI,
 				Headers:    originalReq.Header,
 			},
 		}
@@ -644,7 +648,10 @@ func (f *fail2Ban) sendBanNotification(ip string, failCount uint, originalReq *h
 		// Add custom headers (e.g., API_KEY)
 		for key, value := range f.notifyHeaders {
 			req.Header.Set(key, value)
+			f.logger.Debugf("Adding notification header: %s", key)
 		}
+
+		f.logger.Debugf("Sending ban notification to %s for IP %s", f.notifyURL, ip)
 
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
@@ -657,7 +664,8 @@ func (f *fail2Ban) sendBanNotification(ip string, failCount uint, originalReq *h
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			f.logger.Infof("Ban notification sent successfully for %s", ip)
 		} else {
-			f.logger.Errorf("Ban notification failed for %s with status: %d", ip, resp.StatusCode)
+			body, _ := io.ReadAll(resp.Body)
+			f.logger.Errorf("Ban notification failed for %s with status: %d, response: %s", ip, resp.StatusCode, string(body))
 		}
 	}()
 }
