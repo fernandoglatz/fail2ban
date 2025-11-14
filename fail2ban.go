@@ -15,27 +15,27 @@ import (
 
 // Config passed in from traefik configuration
 type Config struct {
-	NumberFails  uint
-	BanTime      string
-	FailWindow   string
-	ClientHeader string
-	LogLevel     log.LogLevel
-	RedisAddr    string
-	RedisPass    string
-	RedisDB      int
+	NumberFails   uint
+	BanTime       string
+	FailWindow    string
+	ClientHeader  string
+	LogLevel      log.LogLevel
+	RedisAddress  string
+	RedisPassword string
+	RedisDB       int
 }
 
 // Create config with reasonable defaults
 func CreateConfig() *Config {
 	return &Config{
-		NumberFails:  3,
-		BanTime:      "3h",
-		FailWindow:   "10m",
-		ClientHeader: "Cf-Connecting-IP",
-		LogLevel:     log.Info,
-		RedisAddr:    "",
-		RedisPass:    "",
-		RedisDB:      0,
+		NumberFails:   3,
+		BanTime:       "3h",
+		FailWindow:    "10m",
+		ClientHeader:  "Cf-Connecting-IP",
+		LogLevel:      log.Info,
+		RedisAddress:  "",
+		RedisPassword: "",
+		RedisDB:       0,
 	}
 }
 
@@ -83,8 +83,8 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	}
 
 	// Connect to Redis using plain socket if configured
-	if config.RedisAddr != "" {
-		conn, err := net.Dial("tcp", config.RedisAddr)
+	if config.RedisAddress != "" {
+		conn, err := net.Dial("tcp", config.RedisAddress)
 		if err != nil {
 			f.logger.Errorf("Failed to connect to Redis: %v", err)
 			return nil, fmt.Errorf("redis connection failed: %w", err)
@@ -92,8 +92,8 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		f.redisConn = conn
 
 		// Authenticate if password is set
-		if config.RedisPass != "" {
-			if err := f.redisCommand("AUTH", config.RedisPass); err != nil {
+		if config.RedisPassword != "" {
+			if err := f.redisCommand("AUTH", config.RedisPassword); err != nil {
 				f.logger.Errorf("Redis authentication failed: %v", err)
 				return nil, fmt.Errorf("redis auth failed: %w", err)
 			}
@@ -107,7 +107,7 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 			}
 		}
 
-		f.logger.Infof("Connected to Redis at %s", config.RedisAddr)
+		f.logger.Infof("Connected to Redis at %s", config.RedisAddress)
 	}
 
 	f.logger.Infof("Max Number Failures %d, Ban Time %q, Fail Window %q, Client-ID-header %q", f.maxFails, f.banTime, f.failWindow, f.clientHeader)
