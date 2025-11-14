@@ -152,6 +152,7 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if f.isIPDenylisted(client) {
 		f.logger.Infof("%s is denylisted, blocking request", client)
 		rw.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(rw, "You're banned: %s", client)
 		return
 	}
 
@@ -165,6 +166,7 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// block request if client has been banned
 	if f.isClientBanned(client) {
 		rw.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(rw, "You're banned: %s", client)
 		return
 	}
 
