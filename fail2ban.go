@@ -1,15 +1,16 @@
 package fail2ban
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/charanpreetp/fail2ban/log"
-	"github.com/redis/go-redis/v9"
 )
 
 // Config passed in from traefik configuration
@@ -53,8 +54,9 @@ type fail2Ban struct {
 	// mutex is specifically access the bannedClients map
 	mu sync.Mutex
 
-	// Redis client (optional)
-	redisClient *redis.Client
+	// Redis connection via plain socket (optional)
+	redisConn net.Conn
+	redisMu   sync.Mutex
 
 	// this is a test var to signal cleaner is running
 	_cleaning_test_var bool
@@ -80,19 +82,31 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		bannedClients: make(map[string]*client),
 	}
 
-	// Connect to Redis if configured
+	// Connect to Redis using plain socket if configured
 	if config.RedisAddr != "" {
-		f.redisClient = redis.NewClient(&redis.Options{
-			Addr:     config.RedisAddr,
-			Password: config.RedisPass,
-			DB:       config.RedisDB,
-		})
-
-		// Test the connection
-		if err := f.redisClient.Ping(ctx).Err(); err != nil {
+		conn, err := net.Dial("tcp", config.RedisAddr)
+		if err != nil {
 			f.logger.Errorf("Failed to connect to Redis: %v", err)
 			return nil, fmt.Errorf("redis connection failed: %w", err)
 		}
+		f.redisConn = conn
+
+		// Authenticate if password is set
+		if config.RedisPass != "" {
+			if err := f.redisCommand("AUTH", config.RedisPass); err != nil {
+				f.logger.Errorf("Redis authentication failed: %v", err)
+				return nil, fmt.Errorf("redis auth failed: %w", err)
+			}
+		}
+
+		// Select database
+		if config.RedisDB != 0 {
+			if err := f.redisCommand("SELECT", fmt.Sprintf("%d", config.RedisDB)); err != nil {
+				f.logger.Errorf("Redis SELECT failed: %v", err)
+				return nil, fmt.Errorf("redis SELECT failed: %w", err)
+			}
+		}
+
 		f.logger.Infof("Connected to Redis at %s", config.RedisAddr)
 	}
 
@@ -129,11 +143,9 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (f *fail2Ban) isClientBanned(ip string) bool {
-	ctx := context.Background()
-
 	// Use Redis if configured
-	if f.redisClient != nil {
-		return f.isClientBannedRedis(ctx, ip)
+	if f.redisConn != nil {
+		return f.isClientBannedRedis(ip)
 	}
 
 	// Fall back to in-memory
@@ -159,11 +171,9 @@ func (f *fail2Ban) isClientBanned(ip string) bool {
 }
 
 func (f *fail2Ban) incrementViewCounter(ip string) {
-	ctx := context.Background()
-
 	// Use Redis if configured
-	if f.redisClient != nil {
-		f.incrementViewCounterRedis(ctx, ip)
+	if f.redisConn != nil {
+		f.incrementViewCounterRedis(ip)
 		return
 	}
 
@@ -222,16 +232,112 @@ func (f *fail2Ban) cleaner(ctx context.Context) {
 	}
 }
 
-func (f *fail2Ban) isClientBannedRedis(ctx context.Context, ip string) bool {
+// Send Redis command using RESP protocol
+func (f *fail2Ban) redisCommand(cmd string, args ...string) error {
+	f.redisMu.Lock()
+	defer f.redisMu.Unlock()
+
+	// Build RESP array
+	resp := fmt.Sprintf("*%d\r\n", len(args)+1)
+	resp += fmt.Sprintf("$%d\r\n%s\r\n", len(cmd), cmd)
+	for _, arg := range args {
+		resp += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
+	}
+
+	// Send command
+	_, err := f.redisConn.Write([]byte(resp))
+	if err != nil {
+		return fmt.Errorf("write error: %w", err)
+	}
+
+	// Read response
+	_, err = f.readRedisResponse()
+	return err
+}
+
+// Send Redis command and get integer response
+func (f *fail2Ban) redisCommandInt(cmd string, args ...string) (int64, error) {
+	f.redisMu.Lock()
+	defer f.redisMu.Unlock()
+
+	// Build RESP array
+	resp := fmt.Sprintf("*%d\r\n", len(args)+1)
+	resp += fmt.Sprintf("$%d\r\n%s\r\n", len(cmd), cmd)
+	for _, arg := range args {
+		resp += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
+	}
+
+	// Send command
+	_, err := f.redisConn.Write([]byte(resp))
+	if err != nil {
+		return 0, fmt.Errorf("write error: %w", err)
+	}
+
+	// Read response
+	return f.readRedisResponse()
+}
+
+// Read and parse Redis RESP protocol response
+func (f *fail2Ban) readRedisResponse() (int64, error) {
+	reader := bufio.NewReader(f.redisConn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("read error: %w", err)
+	}
+
+	line = strings.TrimSpace(line)
+	if len(line) == 0 {
+		return 0, fmt.Errorf("empty response")
+	}
+
+	switch line[0] {
+	case '+':
+		// Simple string - OK response
+		return 0, nil
+	case '-':
+		// Error
+		return 0, fmt.Errorf("redis error: %s", line[1:])
+	case ':':
+		// Integer
+		var num int64
+		_, err := fmt.Sscanf(line[1:], "%d", &num)
+		return num, err
+	case '$':
+		// Bulk string
+		var size int
+		_, err := fmt.Sscanf(line[1:], "%d", &size)
+		if err != nil {
+			return 0, err
+		}
+		if size == -1 {
+			// Null response
+			return 0, nil
+		}
+		// Read the actual string data
+		data := make([]byte, size+2) // +2 for \r\n
+		_, err = reader.Read(data)
+		if err != nil {
+			return 0, err
+		}
+		// Try to parse as integer
+		var num int64
+		_, err = fmt.Sscanf(string(data[:size]), "%d", &num)
+		if err != nil {
+			return 0, nil
+		}
+		return num, nil
+	default:
+		return 0, fmt.Errorf("unknown response type: %c", line[0])
+	}
+}
+
+func (f *fail2Ban) isClientBannedRedis(ip string) bool {
 	key := fmt.Sprintf("fail2ban:%s", ip)
 
-	// Get fail counter from Redis
-	val, err := f.redisClient.Get(ctx, key).Uint64()
-	if err == redis.Nil {
-		// Key doesn't exist, client is not banned
-		return false
-	} else if err != nil {
-		f.logger.Errorf("Redis error checking %s: %v", ip, err)
+	// Get fail counter from Redis using plain socket
+	val, err := f.redisCommandInt("GET", key)
+	if err != nil {
+		f.logger.Debugf("Redis GET for %s: %v (not banned)", ip, err)
 		return false
 	}
 
@@ -241,18 +347,18 @@ func (f *fail2Ban) isClientBannedRedis(ctx context.Context, ip string) bool {
 	if failCounter >= f.maxFails {
 		// Client is banned, extend the TTL
 		f.logger.Infof("Extend Ban for %s", ip)
-		f.redisClient.Expire(ctx, key, f.banTime)
+		f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banTime.Seconds())))
 		return true
 	}
 
 	return false
 }
 
-func (f *fail2Ban) incrementViewCounterRedis(ctx context.Context, ip string) {
+func (f *fail2Ban) incrementViewCounterRedis(ip string) {
 	key := fmt.Sprintf("fail2ban:%s", ip)
 
 	// Increment counter in Redis
-	count, err := f.redisClient.Incr(ctx, key).Result()
+	count, err := f.redisCommandInt("INCR", key)
 	if err != nil {
 		f.logger.Errorf("Redis error incrementing %s: %v", ip, err)
 		return
@@ -262,10 +368,10 @@ func (f *fail2Ban) incrementViewCounterRedis(ctx context.Context, ip string) {
 
 	// Set expiration on first increment to the failure window
 	if count == 1 {
-		f.redisClient.Expire(ctx, key, f.failWindow)
+		f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.failWindow.Seconds())))
 	} else if uint(count) >= f.maxFails {
 		// Reset TTL to ban time when client gets banned
-		f.redisClient.Expire(ctx, key, f.banTime)
+		f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banTime.Seconds())))
 		f.logger.Infof("Banned %s after %d failures", ip, count)
 	}
 }
