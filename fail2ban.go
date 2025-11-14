@@ -2,7 +2,9 @@ package fail2ban
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -26,22 +28,47 @@ type Config struct {
 	RedisDB        int
 	AllowlistCIDRs []string
 	DenylistCIDRs  []string
+	NotifyURL      string
+	NotifyHeaders  map[string]string
 }
 
 // Create config with reasonable defaults
 func CreateConfig() *Config {
 	return &Config{
-		NumberFails:    3,
-		BanTime:        "3h",
+		NumberFails:    5,
+		BanTime:        "1h",
 		FailWindow:     "10m",
-		ClientHeader:   "Cf-Connecting-IP",
+		ClientHeader:   "X-Real-Ip",
 		LogLevel:       log.Info,
 		RedisAddress:   "",
 		RedisPassword:  "",
 		RedisDB:        0,
 		AllowlistCIDRs: []string{},
 		DenylistCIDRs:  []string{},
+		NotifyURL:      "",
+		NotifyHeaders:  map[string]string{},
 	}
+}
+
+// NotificationRequest contains the request details in the ban notification
+type NotificationRequest struct {
+	Method     string              `json:"method"`
+	Path       string              `json:"path"`
+	Query      string              `json:"query"`
+	Host       string              `json:"host"`
+	UserAgent  string              `json:"user_agent"`
+	Referer    string              `json:"referer"`
+	RemoteAddr string              `json:"remote_addr"`
+	Headers    map[string][]string `json:"headers"`
+}
+
+// NotificationPayload is the JSON structure sent to the notification endpoint
+type NotificationPayload struct {
+	IP        string              `json:"ip"`
+	FailCount uint                `json:"fail_count"`
+	BanTime   string              `json:"ban_time"`
+	Timestamp string              `json:"timestamp"`
+	Request   NotificationRequest `json:"request"`
 }
 
 type fail2Ban struct {
@@ -68,6 +95,10 @@ type fail2Ban struct {
 	redisAddress  string
 	redisPassword string
 	redisDB       int
+
+	// Notification settings
+	notifyURL     string
+	notifyHeaders map[string]string
 
 	// this is a test var to signal cleaner is running
 	_cleaning_test_var bool
@@ -113,6 +144,8 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		allowlistCIDRs: allowlistCIDRs,
 		denylistCIDRs:  denylistCIDRs,
 		bannedClients:  make(map[string]*client),
+		notifyURL:      config.NotifyURL,
+		notifyHeaders:  config.NotifyHeaders,
 	}
 
 	// Connect to Redis using plain socket if configured
@@ -176,7 +209,7 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// check for 4xx class status code
 	if i.checkBadUserRequestStatusCode() {
-		f.incrementViewCounter(client)
+		f.incrementViewCounter(client, req)
 	}
 }
 
@@ -249,13 +282,13 @@ func (f *fail2Ban) isClientBanned(ip string) bool {
 	return false
 }
 
-func (f *fail2Ban) incrementViewCounter(ip string) {
+func (f *fail2Ban) incrementViewCounter(ip string, req *http.Request) {
 	// Use Redis if configured
 	f.redisMu.Lock()
 	useRedis := f.redisConn != nil
 	f.redisMu.Unlock()
 	if useRedis {
-		f.incrementViewCounterRedis(ip)
+		f.incrementViewCounterRedis(ip, req)
 		return
 	}
 
@@ -282,6 +315,11 @@ func (f *fail2Ban) incrementViewCounter(ip string) {
 		f.bannedClients[ip].failCounter++
 	}
 	f.bannedClients[ip].lastViewed = now
+
+	// Send notification if user just got banned
+	if f.bannedClients[ip].failCounter == f.maxFails {
+		f.sendBanNotification(ip, f.bannedClients[ip].failCounter, req)
+	}
 }
 
 // periodically clean up banned clients
@@ -533,7 +571,7 @@ func (f *fail2Ban) isClientBannedRedis(ip string) bool {
 	return false
 }
 
-func (f *fail2Ban) incrementViewCounterRedis(ip string) {
+func (f *fail2Ban) incrementViewCounterRedis(ip string, req *http.Request) {
 	key := fmt.Sprintf("fail2ban:%s", ip)
 
 	// Increment counter in Redis
@@ -558,8 +596,70 @@ func (f *fail2Ban) incrementViewCounterRedis(ip string) {
 			f.logger.Errorf("Redis error setting ban TTL for %s: %v", ip, err)
 		} else {
 			f.logger.Infof("[Redis] Banned %s after %d failures", ip, count)
+			f.sendBanNotification(ip, uint(count), req)
 		}
 	}
+}
+
+// sendBanNotification sends an HTTP POST notification when a user is banned
+func (f *fail2Ban) sendBanNotification(ip string, failCount uint, originalReq *http.Request) {
+	if f.notifyURL == "" {
+		return
+	}
+
+	go func() {
+		// Build notification payload
+		payload := NotificationPayload{
+			IP:        ip,
+			FailCount: failCount,
+			BanTime:   f.banTime.String(),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Request: NotificationRequest{
+				Method:     originalReq.Method,
+				Path:       originalReq.URL.Path,
+				Query:      originalReq.URL.RawQuery,
+				Host:       originalReq.Host,
+				UserAgent:  originalReq.UserAgent(),
+				Referer:    originalReq.Referer(),
+				RemoteAddr: originalReq.RemoteAddr,
+				Headers:    originalReq.Header,
+			},
+		}
+
+		// Marshal to JSON
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			f.logger.Errorf("Failed to marshal ban notification for %s: %v", ip, err)
+			return
+		}
+
+		req, err := http.NewRequest("POST", f.notifyURL, bytes.NewReader(jsonData))
+		if err != nil {
+			f.logger.Errorf("Failed to create ban notification request for %s: %v", ip, err)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		// Add custom headers (e.g., API_KEY)
+		for key, value := range f.notifyHeaders {
+			req.Header.Set(key, value)
+		}
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			f.logger.Errorf("Failed to send ban notification for %s: %v", ip, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			f.logger.Infof("Ban notification sent successfully for %s", ip)
+		} else {
+			f.logger.Errorf("Ban notification failed for %s with status: %d", ip, resp.StatusCode)
+		}
+	}()
 }
 
 func (f *fail2Ban) extractClient(req *http.Request) (string, error) {

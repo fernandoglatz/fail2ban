@@ -18,10 +18,10 @@ summary: Ban IPs that make too many bad HTTP requests (ie, the response from dow
 # This is mandatory,
 # and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
 testData:
-  NumberFails: 3
+  NumberFails: 5
   BanTime: 1h
   FailWindow: 10m
-  ClientHeader: Cf-Connecting-IP
+  ClientHeader: X-Real-Ip
   RedisAddress: redis:6379
   RedisPassword: ""
   RedisDB: 0
@@ -29,3 +29,5 @@ testData:
     - 10.0.0.0/8
   DenylistCIDRs:
     - 192.0.2.0/24
+  NotifyURL: ""
+  NotifyHeaders: {}

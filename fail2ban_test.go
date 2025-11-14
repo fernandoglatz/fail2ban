@@ -270,10 +270,14 @@ func TestIncrementingViewCounter(t *testing.T) {
 	// need to subtract a bit so that timestamps aren't the same
 	start := time.Now().Add(-time.Microsecond)
 
-	f.incrementViewCounter("1")
-	f.incrementViewCounter("2")
-	f.incrementViewCounter("3")
-	f.incrementViewCounter("3")
+	// Create a mock request for testing
+	req := httptest.NewRequest("GET", "http://test.com", nil)
+	req.RemoteAddr = "1.2.3.4:5678"
+
+	f.incrementViewCounter("1", req)
+	f.incrementViewCounter("2", req)
+	f.incrementViewCounter("3", req)
+	f.incrementViewCounter("3", req)
 
 	if len(f.bannedClients) != 3 {
 		t.Error("Banned client map should have 3 clients")
