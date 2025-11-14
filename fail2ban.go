@@ -55,8 +55,9 @@ type fail2Ban struct {
 	mu sync.Mutex
 
 	// Redis connection via plain socket (optional)
-	redisConn net.Conn
-	redisMu   sync.Mutex
+	redisConn   net.Conn
+	redisReader *bufio.Reader
+	redisMu     sync.Mutex
 
 	// this is a test var to signal cleaner is running
 	_cleaning_test_var bool
@@ -90,6 +91,7 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 			return nil, fmt.Errorf("redis connection failed: %w", err)
 		}
 		f.redisConn = conn
+		f.redisReader = bufio.NewReader(conn)
 
 		// Authenticate if password is set
 		if config.RedisPassword != "" {
@@ -279,8 +281,7 @@ func (f *fail2Ban) redisCommandInt(cmd string, args ...string) (int64, error) {
 
 // Read and parse Redis RESP protocol response
 func (f *fail2Ban) readRedisResponse() (int64, error) {
-	reader := bufio.NewReader(f.redisConn)
-	line, err := reader.ReadString('\n')
+	line, err := f.redisReader.ReadString('\n')
 	if err != nil {
 		return 0, fmt.Errorf("read error: %w", err)
 	}
@@ -315,7 +316,7 @@ func (f *fail2Ban) readRedisResponse() (int64, error) {
 		}
 		// Read the actual string data
 		data := make([]byte, size+2) // +2 for \r\n
-		_, err = reader.Read(data)
+		_, err = f.redisReader.Read(data)
 		if err != nil {
 			return 0, err
 		}
