@@ -57,18 +57,18 @@ type NotificationRequest struct {
 	Path       string              `json:"path"`
 	Query      string              `json:"query"`
 	Host       string              `json:"host"`
-	UserAgent  string              `json:"user_agent"`
+	UserAgent  string              `json:"userAgent"`
 	Referer    string              `json:"referer"`
-	RemoteAddr string              `json:"remote_addr"`
-	RequestURI string              `json:"request_uri"`
+	RemoteAddr string              `json:"remoteAddr"`
+	RequestURI string              `json:"requestUri"`
 	Headers    map[string][]string `json:"headers"`
 }
 
 // NotificationPayload is the JSON structure sent to the notification endpoint
 type NotificationPayload struct {
 	IP        string              `json:"ip"`
-	FailCount uint                `json:"fail_count"`
-	BanTime   string              `json:"ban_time"`
+	FailCount uint                `json:"failCount"`
+	BanTime   string              `json:"banTime"`
 	Timestamp string              `json:"timestamp"`
 	Request   NotificationRequest `json:"request"`
 }
