@@ -21,3 +21,6 @@ testData:
   NumberFails: 3
   BanTime: 1h
   ClientHeader: Cf-Connecting-IP
+  RedisAddress: redis:6379
+  RedisPassword: ""
+  RedisDB: 0
