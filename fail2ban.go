@@ -28,6 +28,7 @@ type Config struct {
 	RedisDB        int
 	AllowlistCIDRs []string
 	DenylistCIDRs  []string
+	IgnoreHosts    []string
 	NotifyURL      string
 	NotifyHeaders  map[string]string
 }
@@ -45,6 +46,7 @@ func CreateConfig() *Config {
 		RedisDB:        0,
 		AllowlistCIDRs: []string{},
 		DenylistCIDRs:  []string{},
+		IgnoreHosts:    []string{},
 		NotifyURL:      "",
 		NotifyHeaders:  map[string]string{},
 	}
@@ -86,6 +88,7 @@ type fail2Ban struct {
 	clientHeader   string
 	allowlistCIDRs []*net.IPNet
 	denylistCIDRs  []*net.IPNet
+	ignoreHosts    map[string]struct{}
 	bannedClients  map[string]*client
 	// mutex is specifically access the bannedClients map
 	mu sync.Mutex
@@ -135,6 +138,15 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		denylistCIDRs = append(denylistCIDRs, ipNet)
 	}
 
+	ignoreHosts := make(map[string]struct{}, len(config.IgnoreHosts))
+	for _, host := range config.IgnoreHosts {
+		normalized := normalizeHost(host)
+		if normalized == "" {
+			continue
+		}
+		ignoreHosts[normalized] = struct{}{}
+	}
+
 	f := fail2Ban{
 		name:           middleWareName,
 		logger:         log.New("Fail-2-Ban", config.LogLevel),
@@ -145,6 +157,7 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		failWindow:     failWindow,
 		allowlistCIDRs: allowlistCIDRs,
 		denylistCIDRs:  denylistCIDRs,
+		ignoreHosts:    ignoreHosts,
 		bannedClients:  make(map[string]*client),
 		notifyURL:      config.NotifyURL,
 		notifyHeaders:  config.NotifyHeaders,
@@ -167,6 +180,9 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	}
 	if len(f.denylistCIDRs) > 0 {
 		f.logger.Infof("Denylist CIDRs: %v", config.DenylistCIDRs)
+	}
+	if len(f.ignoreHosts) > 0 {
+		f.logger.Infof("Ignore Hosts: %v", config.IgnoreHosts)
 	}
 	go f.cleaner(ctx)
 
@@ -211,8 +227,51 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// check for 4xx class status code
 	if i.checkBadUserRequestStatusCode() {
+		if f.isHostIgnored(f.getRequestHost(req)) {
+			f.logger.Debugf("Host is ignored, skipping failure tracking")
+			return
+		}
 		f.incrementViewCounter(client, req)
 	}
+}
+
+func (f *fail2Ban) getRequestHost(req *http.Request) string {
+	host := strings.TrimSpace(req.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(req.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	parts := strings.Split(host, ",")
+	if len(parts) > 0 {
+		host = strings.TrimSpace(parts[0])
+	}
+
+	if cleaned, _, err := net.SplitHostPort(host); err == nil {
+		host = cleaned
+	}
+
+	return strings.ToLower(host)
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if cleaned, _, err := net.SplitHostPort(host); err == nil {
+		host = cleaned
+	}
+	return strings.ToLower(host)
+}
+
+func (f *fail2Ban) isHostIgnored(host string) bool {
+	if host == "" || len(f.ignoreHosts) == 0 {
+		return false
+	}
+	_, ok := f.ignoreHosts[host]
+	return ok
 }
 
 func (f *fail2Ban) isIPDenylisted(ipStr string) bool {

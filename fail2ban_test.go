@@ -512,6 +512,121 @@ func TestExtractClient(t *testing.T) {
 	}
 }
 
+func TestIgnoreHostsSkipsTracking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}),
+		&Config{
+			BanTime:     "1s",
+			FailWindow:  "1s",
+			LogLevel:    "ERROR",
+			NumberFails: 1,
+			IgnoreHosts: []string{"ignored.test"},
+		},
+		"test",
+	)
+	if err != nil {
+		t.Errorf("Got error %s", err.Error())
+		t.FailNow()
+	}
+
+	f := h.(*fail2Ban)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "http://ignored.test", nil)
+	request.Host = "ignored.test"
+	request.RemoteAddr = "1.2.3.4:5678"
+
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Errorf("Expected response to be %d but got %d", http.StatusNotFound, response.Code)
+	}
+	if len(f.bannedClients) != 0 {
+		t.Error("Ignored host should not be tracked")
+	}
+}
+
+func TestIgnoreHostsUsesXForwardedHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}),
+		&Config{
+			BanTime:     "1s",
+			FailWindow:  "1s",
+			LogLevel:    "ERROR",
+			NumberFails: 1,
+			IgnoreHosts: []string{"ignored.test"},
+		},
+		"test",
+	)
+	if err != nil {
+		t.Errorf("Got error %s", err.Error())
+		t.FailNow()
+	}
+
+	f := h.(*fail2Ban)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "http://not-ignored.test", nil)
+	request.Host = "not-ignored.test"
+	request.Header.Set("X-Forwarded-Host", "ignored.test")
+	request.RemoteAddr = "1.2.3.4:5678"
+
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Errorf("Expected response to be %d but got %d", http.StatusNotFound, response.Code)
+	}
+	if len(f.bannedClients) != 0 {
+		t.Error("Ignored X-Forwarded-Host should not be tracked")
+	}
+}
+
+func TestIgnoreHostsDoesNotOverrideDenylist(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}),
+		&Config{
+			BanTime:       "1s",
+			FailWindow:    "1s",
+			LogLevel:      "ERROR",
+			NumberFails:   1,
+			IgnoreHosts:   []string{"ignored.test"},
+			DenylistCIDRs: []string{"1.2.3.0/24"},
+		},
+		"test",
+	)
+	if err != nil {
+		t.Errorf("Got error %s", err.Error())
+		t.FailNow()
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "http://ignored.test", nil)
+	request.Host = "ignored.test"
+	request.RemoteAddr = "1.2.3.4:5678"
+
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Errorf("Expected response to be %d but got %d", http.StatusForbidden, response.Code)
+	}
+}
+
 func TestInterceptor(t *testing.T) {
 	rec := httptest.NewRecorder()
 	i := newIntercept(rec)

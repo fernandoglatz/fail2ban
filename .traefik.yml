@@ -29,5 +29,8 @@ testData:
     - 10.0.0.0/8
   DenylistCIDRs:
     - 192.0.2.0/24
+  IgnoreHosts:
+    - status.example.com
+    - healthcheck.example.com
   NotifyURL: ""
   NotifyHeaders: {}

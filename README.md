@@ -6,11 +6,10 @@
 
 This plugin is an HTTP Traefik Middleware which will track wether a client is being naughty or not. This is tracked by checking if there are too many bad client requests (ie, server responds with status code `400` to `499`), the client will be banned from making further requests for a configured amount of time. The Middleware will respond immediately with a `403` response to a client if it is banned and not send the request further downstream.
 
-
 > **NOTE:** Use this with Traefik 2.10+. Version below may still work but there seem to be errors in logs related to Yaegi value reflection panics and other random error messages for this plugin so best to just use Traefik 2.10+ where the Yaegi issue(s) are fixed.
 
-
 ## Configuration Options
+
 Here are a list of settings you can optionally set for the Middleware
 | Config | Default | Description |
 | ------ | ------ | ------ |
@@ -24,6 +23,7 @@ Here are a list of settings you can optionally set for the Middleware
 | RedisDB | `0` | Redis database number to use (0-15) |
 | AllowlistCIDRs | `[]` | List of CIDR ranges to allowlist (e.g., `["10.0.0.0/8", "192.168.1.0/24"]`). IPs matching these ranges will never be banned or tracked |
 | DenylistCIDRs | `[]` | List of CIDR ranges to denylist (e.g., `["192.0.2.0/24", "198.51.100.5/32"]`). IPs matching these ranges will be immediately blocked with 403 Forbidden |
+| IgnoreHosts | `[]` | List of hostnames to ignore (case-insensitive exact match). Requests for these hosts are not tracked for bans (uses `X-Forwarded-Host` if present, otherwise `Host`) |
 | NotifyURL | `""` | HTTP endpoint to send POST notifications when a user is banned (e.g., `"https://api.example.com/ban-webhook"`). Leave empty to disable notifications |
 | NotifyHeaders | `{}` | Custom HTTP headers to include in ban notification requests (e.g., `{"API_KEY": "secret123", "Authorization": "Bearer token"}`). Useful for authentication |
 
@@ -80,13 +80,17 @@ http:
           RedisDB: 0
           # Allowlist trusted IPs/ranges (never banned)
           AllowlistCIDRs:
-            - "10.0.0.0/8"        # Private network
-            - "192.168.1.0/24"    # Local network
-            - "203.0.113.5/32"    # Specific trusted IP
+            - "10.0.0.0/8" # Private network
+            - "192.168.1.0/24" # Local network
+            - "203.0.113.5/32" # Specific trusted IP
           # Denylist malicious IPs/ranges (always blocked)
           DenylistCIDRs:
-            - "192.0.2.0/24"      # Known bad network
-            - "198.51.100.50/32"  # Specific bad IP
+            - "192.0.2.0/24" # Known bad network
+            - "198.51.100.50/32" # Specific bad IP
+          # Ignore hostnames (not tracked for bans)
+          IgnoreHosts:
+            - "status.example.com"
+            - "healthcheck.example.com"
           # Ban notification webhook (optional)
           NotifyURL: "https://api.example.com/ban-webhook"
           NotifyHeaders:
@@ -119,9 +123,14 @@ http:
       "192.0.2.0/24",      # Known bad network
       "198.51.100.50/32"   # Specific bad IP
     ]
+    # Ignore hostnames (not tracked for bans)
+    IgnoreHosts = [
+      "status.example.com",
+      "healthcheck.example.com"
+    ]
     # Ban notification webhook (optional)
     NotifyURL = "https://api.example.com/ban-webhook"
-    
+
     [http.middlewares.my-fail2ban.plugin.fail2ban.NotifyHeaders]
       API_KEY = "secret123"
       Authorization = "Bearer your-token"
