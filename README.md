@@ -26,6 +26,12 @@ Here are a list of settings you can optionally set for the Middleware
 | IgnoreHosts | `[]` | List of hostnames to ignore (case-insensitive exact match). Requests for these hosts are not tracked for bans (uses `X-Forwarded-Host` if present, otherwise `Host`) |
 | NotifyURL | `""` | HTTP endpoint to send POST notifications when a user is banned (e.g., `"https://api.example.com/ban-webhook"`). Leave empty to disable notifications |
 | NotifyHeaders | `{}` | Custom HTTP headers to include in ban notification requests (e.g., `{"API_KEY": "secret123", "Authorization": "Bearer token"}`). Useful for authentication |
+| BanTimeIncrement | `false` | Escalate bans for repeat offenders: ban number N of an IP within `BanHistoryWindow` lasts N × `BanTime` (1h, 2h, 3h… with `BanTime: 1h`). No upper limit. Requests from a banned IP keep extending the ban by its escalated length |
+| BanHistoryWindow | `168h` | How long a past ban counts toward the next ban's length when `BanTimeIncrement` is enabled. Stored in Redis (`fail2ban:bans:<ip>` sorted set) or in memory. Removing only the ban key (`fail2ban:<ip>`) lifts the ban but keeps the history |
+
+### Ban time increment
+
+With `BanTimeIncrement` enabled the plugin remembers each ban of an IP for `BanHistoryWindow`. The first ban lasts `BanTime`, the second `2 × BanTime`, and so on. Bans older than the window no longer count. The notification's `banTime` holds the escalated length and `banCount` the ban number.
 
 ## Ban Notifications
 
@@ -38,17 +44,20 @@ The notification is sent as JSON with the following structure:
 ```json
 {
   "ip": "192.168.1.100",
-  "fail_count": 5,
-  "ban_time": "1h0m0s",
+  "failCount": 5,
+  "banTime": "2h0m0s",
+  "banCount": 2,
   "timestamp": "2025-11-14T12:30:45Z",
   "request": {
     "method": "POST",
+    "scheme": "",
     "path": "/api/login",
     "query": "redirect=/dashboard",
     "host": "example.com",
-    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...",
     "referer": "https://example.com/",
-    "remote_addr": "192.168.1.100:54321",
+    "remoteAddr": "192.168.1.100:54321",
+    "requestUri": "/api/login?redirect=/dashboard",
     "headers": {
       "Accept": ["application/json"],
       "Content-Type": ["application/x-www-form-urlencoded"],

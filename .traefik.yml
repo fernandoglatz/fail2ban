@@ -34,3 +34,5 @@ testData:
     - healthcheck.example.com
   NotifyURL: ""
   NotifyHeaders: {}
+  BanTimeIncrement: false
+  BanHistoryWindow: 168h
