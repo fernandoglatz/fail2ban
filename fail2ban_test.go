@@ -1,8 +1,10 @@
 package fail2ban
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -270,10 +272,14 @@ func TestIncrementingViewCounter(t *testing.T) {
 	// need to subtract a bit so that timestamps aren't the same
 	start := time.Now().Add(-time.Microsecond)
 
-	f.incrementViewCounter("1")
-	f.incrementViewCounter("2")
-	f.incrementViewCounter("3")
-	f.incrementViewCounter("3")
+	// Create a mock request for testing
+	req := httptest.NewRequest("GET", "http://test.com", nil)
+	req.RemoteAddr = "1.2.3.4:5678"
+
+	f.incrementViewCounter("1", req)
+	f.incrementViewCounter("2", req)
+	f.incrementViewCounter("3", req)
+	f.incrementViewCounter("3", req)
 
 	if len(f.bannedClients) != 3 {
 		t.Error("Banned client map should have 3 clients")
@@ -508,12 +514,200 @@ func TestExtractClient(t *testing.T) {
 	}
 }
 
+func TestIgnoreHostsSkipsTracking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}),
+		&Config{
+			BanTime:     "1s",
+			FailWindow:  "1s",
+			LogLevel:    "ERROR",
+			NumberFails: 1,
+			IgnoreHosts: []string{"ignored.test"},
+		},
+		"test",
+	)
+	if err != nil {
+		t.Errorf("Got error %s", err.Error())
+		t.FailNow()
+	}
+
+	f := h.(*fail2Ban)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "http://ignored.test", nil)
+	request.Host = "ignored.test"
+	request.RemoteAddr = "1.2.3.4:5678"
+
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Errorf("Expected response to be %d but got %d", http.StatusNotFound, response.Code)
+	}
+	if len(f.bannedClients) != 0 {
+		t.Error("Ignored host should not be tracked")
+	}
+}
+
+func TestIgnoreHostsUsesXForwardedHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}),
+		&Config{
+			BanTime:     "1s",
+			FailWindow:  "1s",
+			LogLevel:    "ERROR",
+			NumberFails: 1,
+			IgnoreHosts: []string{"ignored.test"},
+		},
+		"test",
+	)
+	if err != nil {
+		t.Errorf("Got error %s", err.Error())
+		t.FailNow()
+	}
+
+	f := h.(*fail2Ban)
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "http://not-ignored.test", nil)
+	request.Host = "not-ignored.test"
+	request.Header.Set("X-Forwarded-Host", "ignored.test")
+	request.RemoteAddr = "1.2.3.4:5678"
+
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Errorf("Expected response to be %d but got %d", http.StatusNotFound, response.Code)
+	}
+	if len(f.bannedClients) != 0 {
+		t.Error("Ignored X-Forwarded-Host should not be tracked")
+	}
+}
+
+func TestIgnoreHostsDoesNotOverrideDenylist(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}),
+		&Config{
+			BanTime:       "1s",
+			FailWindow:    "1s",
+			LogLevel:      "ERROR",
+			NumberFails:   1,
+			IgnoreHosts:   []string{"ignored.test"},
+			DenylistCIDRs: []string{"1.2.3.0/24"},
+		},
+		"test",
+	)
+	if err != nil {
+		t.Errorf("Got error %s", err.Error())
+		t.FailNow()
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "http://ignored.test", nil)
+	request.Host = "ignored.test"
+	request.RemoteAddr = "1.2.3.4:5678"
+
+	h.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Errorf("Expected response to be %d but got %d", http.StatusForbidden, response.Code)
+	}
+}
+
 func TestInterceptor(t *testing.T) {
 	rec := httptest.NewRecorder()
 	i := newIntercept(rec)
 	i.WriteHeader(123)
 	if rec.Code != 123 {
 		t.Errorf("Failed to intercept, got %d", rec.Code)
+	}
+}
+
+func TestServeHTTPAllowsConnectionHijack(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
+	cancel()
+
+	h, err := New(
+		ctx,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Same check a reverse proxy makes before switching protocols (websocket)
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack not supported", http.StatusInternalServerError)
+				return
+			}
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			rw.Flush()
+		}),
+		&Config{
+			BanTime:     "1s",
+			FailWindow:  "1s",
+			LogLevel:    "ERROR",
+			NumberFails: 3,
+		},
+		"test",
+	)
+	if err != nil {
+		t.Fatalf("Got error %s", err.Error())
+	}
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to dial test server: %s", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	fmt.Fprint(conn, "GET /socket HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("Failed to read response: %s", err)
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		t.Errorf("Expected response to be %d but got %d", http.StatusSwitchingProtocols, response.StatusCode)
+	}
+}
+
+func TestInterceptorHijackUnsupported(t *testing.T) {
+	i := newIntercept(httptest.NewRecorder())
+	if _, _, err := i.Hijack(); err == nil {
+		t.Error("Expected an error when the wrapped writer cannot be hijacked")
+	}
+}
+
+func TestInterceptorFlush(t *testing.T) {
+	rec := httptest.NewRecorder()
+	var w http.ResponseWriter = newIntercept(rec)
+	f, ok := w.(http.Flusher)
+	if !ok {
+		t.Fatal("Interceptor should implement http.Flusher")
+	}
+	f.Flush()
+	if !rec.Flushed {
+		t.Error("Flush was not passed to the wrapped writer")
 	}
 }
 

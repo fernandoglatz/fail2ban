@@ -2,7 +2,9 @@ package fail2ban
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -26,22 +28,61 @@ type Config struct {
 	RedisDB        int
 	AllowlistCIDRs []string
 	DenylistCIDRs  []string
+	IgnoreHosts    []string
+	NotifyURL      string
+	NotifyHeaders  map[string]string
+	// BanTimeIncrement makes repeat offenders' bans longer: ban #N within
+	// BanHistoryWindow lasts N × BanTime.
+	BanTimeIncrement bool
+	// BanHistoryWindow is how long a past ban counts toward the next one.
+	BanHistoryWindow string
 }
 
 // Create config with reasonable defaults
 func CreateConfig() *Config {
 	return &Config{
-		NumberFails:    3,
-		BanTime:        "3h",
-		FailWindow:     "10m",
-		ClientHeader:   "Cf-Connecting-IP",
-		LogLevel:       log.Info,
-		RedisAddress:   "",
-		RedisPassword:  "",
-		RedisDB:        0,
-		AllowlistCIDRs: []string{},
-		DenylistCIDRs:  []string{},
+		NumberFails:      5,
+		BanTime:          "1h",
+		FailWindow:       "10m",
+		ClientHeader:     "X-Real-Ip",
+		LogLevel:         log.Info,
+		RedisAddress:     "",
+		RedisPassword:    "",
+		RedisDB:          0,
+		AllowlistCIDRs:   []string{},
+		DenylistCIDRs:    []string{},
+		IgnoreHosts:      []string{},
+		NotifyURL:        "",
+		NotifyHeaders:    map[string]string{},
+		BanTimeIncrement: false,
+		BanHistoryWindow: defaultBanHistoryWindow,
 	}
+}
+
+const defaultBanHistoryWindow = "168h"
+
+// NotificationRequest contains the request details in the ban notification
+type NotificationRequest struct {
+	Method     string              `json:"method"`
+	Scheme     string              `json:"scheme"`
+	Path       string              `json:"path"`
+	Query      string              `json:"query"`
+	Host       string              `json:"host"`
+	UserAgent  string              `json:"userAgent"`
+	Referer    string              `json:"referer"`
+	RemoteAddr string              `json:"remoteAddr"`
+	RequestURI string              `json:"requestUri"`
+	Headers    map[string][]string `json:"headers"`
+}
+
+// NotificationPayload is the JSON structure sent to the notification endpoint
+type NotificationPayload struct {
+	IP        string              `json:"ip"`
+	FailCount uint                `json:"failCount"`
+	BanTime   string              `json:"banTime"`
+	BanCount  int64               `json:"banCount"`
+	Timestamp string              `json:"timestamp"`
+	Request   NotificationRequest `json:"request"`
 }
 
 type fail2Ban struct {
@@ -57,8 +98,14 @@ type fail2Ban struct {
 	clientHeader   string
 	allowlistCIDRs []*net.IPNet
 	denylistCIDRs  []*net.IPNet
+	ignoreHosts    map[string]struct{}
 	bannedClients  map[string]*client
-	// mutex is specifically access the bannedClients map
+	// ban escalation (BanTimeIncrement)
+	banTimeIncrement bool
+	banHistoryWindow time.Duration
+	// in-memory ban start times per IP, used when Redis is not configured
+	banHistory map[string][]time.Time
+	// mutex is specifically access the bannedClients and banHistory maps
 	mu sync.Mutex
 
 	// Redis connection via plain socket (optional)
@@ -68,6 +115,10 @@ type fail2Ban struct {
 	redisAddress  string
 	redisPassword string
 	redisDB       int
+
+	// Notification settings
+	notifyURL     string
+	notifyHeaders map[string]string
 
 	// this is a test var to signal cleaner is running
 	_cleaning_test_var bool
@@ -81,6 +132,17 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	failWindow, err := time.ParseDuration(config.FailWindow)
 	if err != nil {
 		return nil, err
+	}
+	historyWindowStr := config.BanHistoryWindow
+	if historyWindowStr == "" {
+		historyWindowStr = defaultBanHistoryWindow
+	}
+	banHistoryWindow, err := time.ParseDuration(historyWindowStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid BanHistoryWindow %q: %w", config.BanHistoryWindow, err)
+	}
+	if config.BanTimeIncrement && banHistoryWindow <= 0 {
+		return nil, fmt.Errorf("BanHistoryWindow must be positive when BanTimeIncrement is enabled, got %q", config.BanHistoryWindow)
 	}
 	// Parse allowlist CIDRs
 	allowlistCIDRs := make([]*net.IPNet, 0, len(config.AllowlistCIDRs))
@@ -102,6 +164,15 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		denylistCIDRs = append(denylistCIDRs, ipNet)
 	}
 
+	ignoreHosts := make(map[string]struct{}, len(config.IgnoreHosts))
+	for _, host := range config.IgnoreHosts {
+		normalized := normalizeHost(host)
+		if normalized == "" {
+			continue
+		}
+		ignoreHosts[normalized] = struct{}{}
+	}
+
 	f := fail2Ban{
 		name:           middleWareName,
 		logger:         log.New("Fail-2-Ban", config.LogLevel),
@@ -112,7 +183,14 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 		failWindow:     failWindow,
 		allowlistCIDRs: allowlistCIDRs,
 		denylistCIDRs:  denylistCIDRs,
+		ignoreHosts:    ignoreHosts,
 		bannedClients:  make(map[string]*client),
+		notifyURL:      config.NotifyURL,
+		notifyHeaders:  config.NotifyHeaders,
+
+		banTimeIncrement: config.BanTimeIncrement,
+		banHistoryWindow: banHistoryWindow,
+		banHistory:       make(map[string][]time.Time),
 	}
 
 	// Connect to Redis using plain socket if configured
@@ -133,6 +211,12 @@ func New(ctx context.Context, next http.Handler, config *Config, middleWareName 
 	if len(f.denylistCIDRs) > 0 {
 		f.logger.Infof("Denylist CIDRs: %v", config.DenylistCIDRs)
 	}
+	if len(f.ignoreHosts) > 0 {
+		f.logger.Infof("Ignore Hosts: %v", config.IgnoreHosts)
+	}
+	if f.banTimeIncrement {
+		f.logger.Infof("Ban time increment enabled: ban #N lasts N x %s, history window %s", f.banTime, f.banHistoryWindow)
+	}
 	go f.cleaner(ctx)
 
 	return &f, err
@@ -148,18 +232,18 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	f.logger.Debugf("Request from %s", client)
 
+	// Skip ban logic for allowlisted IPs (allowlist takes precedence)
+	if f.isIPAllowlisted(client) {
+		f.logger.Debugf("%s is allowlisted, skipping ban check", client)
+		f.next.ServeHTTP(rw, req)
+		return
+	}
+
 	// Block denylisted IPs immediately
 	if f.isIPDenylisted(client) {
 		f.logger.Infof("%s is denylisted, blocking request", client)
 		rw.WriteHeader(http.StatusForbidden)
 		fmt.Fprintf(rw, "You're banned: %s", client)
-		return
-	}
-
-	// Skip ban logic for allowlisted IPs
-	if f.isIPAllowlisted(client) {
-		f.logger.Debugf("%s is allowlisted, skipping ban check", client)
-		f.next.ServeHTTP(rw, req)
 		return
 	}
 
@@ -176,8 +260,51 @@ func (f *fail2Ban) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// check for 4xx class status code
 	if i.checkBadUserRequestStatusCode() {
-		f.incrementViewCounter(client)
+		if f.isHostIgnored(f.getRequestHost(req)) {
+			f.logger.Debugf("Host is ignored, skipping failure tracking")
+			return
+		}
+		f.incrementViewCounter(client, req)
 	}
+}
+
+func (f *fail2Ban) getRequestHost(req *http.Request) string {
+	host := strings.TrimSpace(req.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(req.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	parts := strings.Split(host, ",")
+	if len(parts) > 0 {
+		host = strings.TrimSpace(parts[0])
+	}
+
+	if cleaned, _, err := net.SplitHostPort(host); err == nil {
+		host = cleaned
+	}
+
+	return strings.ToLower(host)
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if cleaned, _, err := net.SplitHostPort(host); err == nil {
+		host = cleaned
+	}
+	return strings.ToLower(host)
+}
+
+func (f *fail2Ban) isHostIgnored(host string) bool {
+	if host == "" || len(f.ignoreHosts) == 0 {
+		return false
+	}
+	_, ok := f.ignoreHosts[host]
+	return ok
 }
 
 func (f *fail2Ban) isIPDenylisted(ipStr string) bool {
@@ -235,7 +362,7 @@ func (f *fail2Ban) isClientBanned(ip string) bool {
 		return false
 	} else if c.failCounter >= f.maxFails {
 		// Un-ban
-		if c.hasBanExpired(time.Now(), f.banTime) {
+		if c.hasBanExpired(time.Now(), c.effectiveBanTime(f.banTime)) {
 			f.logger.Infof("[In-Memory] Un-Banned %s", ip)
 			delete(f.bannedClients, ip)
 		} else {
@@ -249,13 +376,13 @@ func (f *fail2Ban) isClientBanned(ip string) bool {
 	return false
 }
 
-func (f *fail2Ban) incrementViewCounter(ip string) {
+func (f *fail2Ban) incrementViewCounter(ip string, req *http.Request) {
 	// Use Redis if configured
 	f.redisMu.Lock()
 	useRedis := f.redisConn != nil
 	f.redisMu.Unlock()
 	if useRedis {
-		f.incrementViewCounterRedis(ip)
+		f.incrementViewCounterRedis(ip, req)
 		return
 	}
 
@@ -282,6 +409,59 @@ func (f *fail2Ban) incrementViewCounter(ip string) {
 		f.bannedClients[ip].failCounter++
 	}
 	f.bannedClients[ip].lastViewed = now
+
+	// Start the ban (and notify) exactly once, when the counter hits the limit
+	if c := f.bannedClients[ip]; c.failCounter == f.maxFails {
+		banCount := int64(1)
+		if f.banTimeIncrement {
+			banCount = f.recordBanMemory(ip, now)
+		}
+		c.banDuration = f.escalatedBanTime(banCount)
+		f.logger.Infof("[In-Memory] Banned %s for %s (ban #%d)", ip, c.banDuration, banCount)
+		f.sendBanNotification(ip, c.failCounter, c.banDuration, banCount, req)
+	}
+}
+
+// escalatedBanTime returns how long ban number banCount lasts: N × BanTime
+// with BanTimeIncrement, otherwise always BanTime.
+func (f *fail2Ban) escalatedBanTime(banCount int64) time.Duration {
+	if !f.banTimeIncrement || banCount < 1 {
+		return f.banTime
+	}
+	return f.banTime * time.Duration(banCount)
+}
+
+// recordBanMemory stores a new ban for ip and returns how many bans it has
+// within the history window (including this one). Caller must hold f.mu.
+func (f *fail2Ban) recordBanMemory(ip string, now time.Time) int64 {
+	cutoff := now.Add(-f.banHistoryWindow)
+	kept := f.banHistory[ip][:0]
+	for _, t := range f.banHistory[ip] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	f.banHistory[ip] = append(kept, now)
+	return int64(len(f.banHistory[ip]))
+}
+
+// pruneBanHistory drops in-memory ban records older than the history
+// window. Caller must hold f.mu.
+func (f *fail2Ban) pruneBanHistory(now time.Time) {
+	cutoff := now.Add(-f.banHistoryWindow)
+	for ip, times := range f.banHistory {
+		kept := times[:0]
+		for _, t := range times {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(f.banHistory, ip)
+		} else {
+			f.banHistory[ip] = kept
+		}
+	}
 }
 
 // periodically clean up banned clients
@@ -299,8 +479,9 @@ func (f *fail2Ban) cleaner(ctx context.Context) {
 			f._cleaning_test_var = true
 			{
 				now := time.Now()
+				f.pruneBanHistory(now)
 				for ip, c := range f.bannedClients {
-					if c.hasBanExpired(now, f.banTime) {
+					if c.hasBanExpired(now, c.effectiveBanTime(f.banTime)) {
 						f.logger.Infof("[In-Memory] Clearing out state for %s, it is no longer banned", ip)
 						delete(f.bannedClients, ip)
 					} else {
@@ -522,9 +703,10 @@ func (f *fail2Ban) isClientBannedRedis(ip string) bool {
 	f.logger.Debugf("[Redis] Checking for %s (count: %d)", ip, failCounter)
 
 	if failCounter >= f.maxFails {
-		// Client is banned, extend the TTL
-		f.logger.Infof("[Redis] Extend Ban for %s", ip)
-		if err := f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banTime.Seconds()))); err != nil {
+		// Client is banned, extend the TTL by its (possibly escalated) ban time
+		banTime := f.currentBanTimeRedis(ip)
+		f.logger.Infof("[Redis] Extend Ban for %s (%s)", ip, banTime)
+		if err := f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(banTime.Seconds()))); err != nil {
 			f.logger.Errorf("Failed to extend ban expiration for %s: %v", ip, err)
 		}
 		return true
@@ -533,7 +715,7 @@ func (f *fail2Ban) isClientBannedRedis(ip string) bool {
 	return false
 }
 
-func (f *fail2Ban) incrementViewCounterRedis(ip string) {
+func (f *fail2Ban) incrementViewCounterRedis(ip string, req *http.Request) {
 	key := fmt.Sprintf("fail2ban:%s", ip)
 
 	// Increment counter in Redis
@@ -551,15 +733,137 @@ func (f *fail2Ban) incrementViewCounterRedis(ip string) {
 			f.logger.Errorf("Redis error setting TTL for %s: %v", ip, err)
 			// Try to clean up the key to avoid indefinite persistence
 			f.redisCommand("DEL", key)
-		}
-	} else if uint(count) >= f.maxFails {
-		// Reset TTL to ban time when client gets banned
-		if err := f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banTime.Seconds()))); err != nil {
-			f.logger.Errorf("Redis error setting ban TTL for %s: %v", ip, err)
-		} else {
-			f.logger.Infof("[Redis] Banned %s after %d failures", ip, count)
+			return
 		}
 	}
+
+	// INCR is atomic, so exactly one request sees the limit: start the ban
+	// there. Requests already in flight may push the counter past it; they
+	// must not record another ban or reset the ban TTL.
+	if uint(count) != f.maxFails {
+		return
+	}
+
+	banTime, banCount := f.banTime, int64(1)
+	if f.banTimeIncrement {
+		if n, err := f.recordBanRedis(ip, time.Now()); err != nil {
+			f.logger.Errorf("Redis error recording ban history for %s, using base ban time: %v", ip, err)
+		} else {
+			banCount = n
+			banTime = f.escalatedBanTime(n)
+		}
+	}
+
+	if err := f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(banTime.Seconds()))); err != nil {
+		f.logger.Errorf("Redis error setting ban TTL for %s: %v", ip, err)
+		return
+	}
+	f.logger.Infof("[Redis] Banned %s after %d failures for %s (ban #%d)", ip, count, banTime, banCount)
+	f.sendBanNotification(ip, uint(count), banTime, banCount, req)
+}
+
+func banHistoryKey(ip string) string {
+	return fmt.Sprintf("fail2ban:bans:%s", ip)
+}
+
+// recordBanRedis stores a new ban for ip in a sorted set (score = unix time)
+// and returns how many bans it has within the history window, this one
+// included. The set expires one window after the latest ban.
+func (f *fail2Ban) recordBanRedis(ip string, now time.Time) (int64, error) {
+	key := banHistoryKey(ip)
+	cutoff := now.Add(-f.banHistoryWindow).Unix()
+	if _, err := f.redisCommandInt("ZREMRANGEBYSCORE", key, "-inf", fmt.Sprintf("%d", cutoff)); err != nil {
+		return 0, err
+	}
+	if _, err := f.redisCommandInt("ZADD", key, fmt.Sprintf("%d", now.Unix()), fmt.Sprintf("%d", now.UnixNano())); err != nil {
+		return 0, err
+	}
+	if err := f.redisCommand("EXPIRE", key, fmt.Sprintf("%d", int(f.banHistoryWindow.Seconds()))); err != nil {
+		f.logger.Errorf("Redis error setting ban history TTL for %s: %v", ip, err)
+	}
+	return f.redisCommandInt("ZCARD", key)
+}
+
+// currentBanTimeRedis returns the ban length for an IP that is already
+// banned, based on its recorded ban history.
+func (f *fail2Ban) currentBanTimeRedis(ip string) time.Duration {
+	if !f.banTimeIncrement {
+		return f.banTime
+	}
+	n, err := f.redisCommandInt("ZCARD", banHistoryKey(ip))
+	if err != nil {
+		f.logger.Errorf("Redis error reading ban history for %s, using base ban time: %v", ip, err)
+		return f.banTime
+	}
+	return f.escalatedBanTime(n)
+}
+
+// sendBanNotification sends an HTTP POST notification when a user is banned
+func (f *fail2Ban) sendBanNotification(ip string, failCount uint, banTime time.Duration, banCount int64, originalReq *http.Request) {
+	if f.notifyURL == "" {
+		return
+	}
+
+	go func() {
+		// Build notification payload
+		payload := NotificationPayload{
+			IP:        ip,
+			FailCount: failCount,
+			BanTime:   banTime.String(),
+			BanCount:  banCount,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Request: NotificationRequest{
+				Method:     originalReq.Method,
+				Scheme:     originalReq.URL.Scheme,
+				Path:       originalReq.URL.Path,
+				Query:      originalReq.URL.RawQuery,
+				Host:       originalReq.Host,
+				UserAgent:  originalReq.UserAgent(),
+				Referer:    originalReq.Referer(),
+				RemoteAddr: originalReq.RemoteAddr,
+				RequestURI: originalReq.RequestURI,
+				Headers:    originalReq.Header,
+			},
+		}
+
+		// Marshal to JSON
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			f.logger.Errorf("Failed to marshal ban notification for %s: %v", ip, err)
+			return
+		}
+
+		req, err := http.NewRequest("POST", f.notifyURL, bytes.NewReader(jsonData))
+		if err != nil {
+			f.logger.Errorf("Failed to create ban notification request for %s: %v", ip, err)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+
+		// Add custom headers (e.g., API_KEY)
+		for key, value := range f.notifyHeaders {
+			req.Header.Set(key, value)
+			f.logger.Debugf("Adding notification header: %s", key)
+		}
+
+		f.logger.Debugf("Sending ban notification to %s for IP %s", f.notifyURL, ip)
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			f.logger.Errorf("Failed to send ban notification for %s: %v", ip, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			f.logger.Infof("Ban notification sent successfully for %s", ip)
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			f.logger.Errorf("Ban notification failed for %s with status: %d, response: %s", ip, resp.StatusCode, string(body))
+		}
+	}()
 }
 
 func (f *fail2Ban) extractClient(req *http.Request) (string, error) {
@@ -568,8 +872,15 @@ func (f *fail2Ban) extractClient(req *http.Request) (string, error) {
 		if len(client) == 0 {
 			return "", fmt.Errorf("failed to extract Client Identifier from %q Header", f.clientHeader)
 		}
+
+		host, _, err := net.SplitHostPort(client)
+		if err == nil {
+			client = host
+		}
+
 		return client, nil
 	}
+
 	if client, _, err := net.SplitHostPort(req.RemoteAddr); err != nil {
 		return "", fmt.Errorf("failed to extract Client IP from RemoteAddr: %w", err)
 	} else {
@@ -597,11 +908,37 @@ func (i *interceptor) WriteHeader(code int) {
 	i.ResponseWriter.WriteHeader(code)
 }
 
+// Hijack lets protocol upgrades (websocket) through; without it the proxy answers 500
+func (i *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := i.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("%T does not implement http.Hijacker", i.ResponseWriter)
+	}
+	return hj.Hijack()
+}
+
+// Flush keeps streamed responses (SSE) unbuffered
+func (i *interceptor) Flush() {
+	if f, ok := i.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // client data tracking struct
 type client struct {
 	firstFailure time.Time
 	lastViewed   time.Time
 	failCounter  uint
+	// banDuration is this client's (possibly escalated) ban length; zero
+	// means the configured BanTime
+	banDuration time.Duration
+}
+
+func (c client) effectiveBanTime(defaultBanTime time.Duration) time.Duration {
+	if c.banDuration > 0 {
+		return c.banDuration
+	}
+	return defaultBanTime
 }
 
 func (c client) hasBanExpired(currentTime time.Time, d time.Duration) bool {
