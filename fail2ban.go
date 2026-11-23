@@ -771,6 +771,22 @@ func (i *interceptor) WriteHeader(code int) {
 	i.ResponseWriter.WriteHeader(code)
 }
 
+// Hijack lets protocol upgrades (websocket) through; without it the proxy answers 500
+func (i *interceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := i.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("%T does not implement http.Hijacker", i.ResponseWriter)
+	}
+	return hj.Hijack()
+}
+
+// Flush keeps streamed responses (SSE) unbuffered
+func (i *interceptor) Flush() {
+	if f, ok := i.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // client data tracking struct
 type client struct {
 	firstFailure time.Time
